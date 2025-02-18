@@ -1,12 +1,14 @@
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, render_template, request, jsonify, send_from_directory, redirect
 from twelvelabs import TwelveLabs
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams, Distance, PointStruct
 import os
 from werkzeug.utils import secure_filename
 import tempfile
 from dotenv import load_dotenv
 import uuid
+import boto3
+from botocore.exceptions import ClientError
 
 
 load_dotenv()
@@ -14,6 +16,12 @@ load_dotenv()
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = os.path.join(os.getcwd(), 'uploads')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 
+
+
+AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY')
+AWS_SECRET_KEY = os.getenv('AWS_SECRET_KEY')
+AWS_BUCKET_NAME = os.getenv('AWS_BUCKET_NAME')
+AWS_REGION = os.getenv('AWS_REGION', 'us-east-1')
 
 
 TWELVE_LABS_API_KEY = os.getenv('TWELVE_LABS_API_KEY')
@@ -40,6 +48,209 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 COLLECTION_NAME = "content_collection"
 VECTOR_SIZE = 1024
 ALLOWED_VIDEO_EXTENSIONS = {'mp4', 'avi', 'mov', 'wmv'}
+
+
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_KEY'),
+    region_name=os.getenv('AWS_REGION', 'us-east-1')
+)
+
+AWS_BUCKET_NAME = os.getenv('AWS_BUCKET_NAME')
+
+
+
+@app.route('/video/<video_id>')
+def serve_video(video_id):
+    try:
+        # Search for video in Qdrant using payload filter
+        search_results = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="video_id",
+                        match=models.MatchValue(value=video_id)
+                    )
+                ]
+            ),
+            limit=1
+        )[0]  # Get first batch of results
+        
+        if not search_results:
+            print(f"Video not found: {video_id}")
+            return jsonify({'error': 'Video not found'}), 404
+            
+        video_info = search_results[0].payload
+        
+        print(f"Found video info: {video_info}")
+        
+        # If it's a URL-based video (including S3), return the URL
+        if video_info.get('is_url', False) and video_info.get('video_url'):
+            return redirect(video_info['video_url'])
+        
+        # For local files, serve from uploads directory
+        return send_from_directory(app.config['UPLOAD_FOLDER'], video_id)
+        
+    except Exception as e:
+        print(f"Error serving video: {str(e)}")
+        return jsonify({'error': 'Video not found'}), 404
+    
+
+def upload_to_s3(file_path, filename):
+    """
+    Upload a file to S3 and return its public URL
+    """
+    try:
+        # Upload the file
+        s3_client.upload_file(
+            file_path, 
+            AWS_BUCKET_NAME, 
+            f"videos/{filename}",
+            ExtraArgs={
+                'ACL': 'public-read',
+                'ContentType': 'video/mp4'
+            }
+        )
+
+        # Generate the public URL
+        url = f"https://{AWS_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/videos/{filename}"
+        return url
+
+    except ClientError as e:
+        print(f"Error uploading to S3: {str(e)}")
+        raise
+
+
+@app.route('/upload_video', methods=['POST'])
+def upload_video():
+    print("Received video upload request")
+    
+    try:
+        if 'video_url' in request.form:
+            video_url = request.form['video_url']
+            print(f"Processing video URL: {video_url}")
+            
+            video_id = str(uuid.uuid4())
+            task = twelvelabs_client.embed.task.create(
+                model_name="Marengo-retrieval-2.7",
+                video_url=video_url
+            )
+            
+            print(f"Created task for URL: id={task.id}, status={task.status}")
+            task.wait_for_done(sleep_interval=3)
+            task_result = twelvelabs_client.embed.task.retrieve(task.id)
+            
+            if task_result.status != 'ready':
+                raise ValueError(f"Task failed with status: {task_result.status}")
+            
+            points = [
+                PointStruct(
+                    id=idx,
+                    vector=v.embeddings_float,
+                    payload={
+                        'video_id': video_id,
+                        'video_url': video_url,
+                        'is_url': True,
+                        'start_offset_sec': v.start_offset_sec,
+                        'end_offset_sec': v.end_offset_sec,
+                        'embedding_scope': v.embedding_scope,
+                        'original_filename': video_url.split('/')[-1],
+                        'confidence': 'high' if idx % 2 == 0 else 'medium'
+                    }
+                )
+                for idx, v in enumerate(task_result.video_embedding.segments)
+            ]
+            
+            success_message = {
+                'message': 'Video URL processed successfully',
+                'video_id': video_id,
+                'video_url': video_url,
+                'segments': len(points)
+            }
+            
+        elif 'video' in request.files:
+            video_file = request.files['video']
+            if video_file.filename == '':
+                return jsonify({'error': 'No selected file'}), 400
+            
+            if not allowed_video_file(video_file.filename):
+                return jsonify({'error': 'Invalid file type'}), 400
+            
+            filename = str(uuid.uuid4()) + '_' + secure_filename(video_file.filename)
+            temp_path = os.path.join(tempfile.gettempdir(), filename)
+            
+            try:
+                video_file.save(temp_path)
+                print(f"File saved temporarily to: {temp_path}")
+                
+                # Upload to S3
+                s3_client.upload_file(
+                    temp_path,
+                    AWS_BUCKET_NAME,
+                    f"videos/{filename}",
+                    ExtraArgs={
+                        'ACL': 'public-read',
+                        'ContentType': 'video/mp4'
+                    }
+                )
+                s3_video_url = f"https://{AWS_BUCKET_NAME}.s3.{os.getenv('AWS_REGION', 'us-east-1')}.amazonaws.com/videos/{filename}"
+                print(f"File uploaded to S3: {s3_video_url}")
+                
+                # Create embedding task
+                task = twelvelabs_client.embed.task.create(
+                    model_name="Marengo-retrieval-2.7",
+                    video_file=temp_path
+                )
+                
+                print(f"Created embedding task: id={task.id}, status={task.status}")
+                task.wait_for_done(sleep_interval=3)
+                task_result = twelvelabs_client.embed.task.retrieve(task.id)
+                
+                if task_result.status != 'ready':
+                    s3_client.delete_object(Bucket=AWS_BUCKET_NAME, Key=f"videos/{filename}")
+                    raise ValueError(f"Embedding task failed with status: {task_result.status}")
+                
+                points = [
+                    PointStruct(
+                        id=idx,
+                        vector=v.embeddings_float,
+                        payload={
+                            'video_id': filename,
+                            'video_url': s3_video_url,
+                            'is_url': True,
+                            'start_offset_sec': v.start_offset_sec,
+                            'end_offset_sec': v.end_offset_sec,
+                            'embedding_scope': v.embedding_scope,
+                            'original_filename': video_file.filename,
+                            'confidence': 'high' if idx % 2 == 0 else 'medium'
+                        }
+                    )
+                    for idx, v in enumerate(task_result.video_embedding.segments)
+                ]
+                
+                success_message = {
+                    'message': 'Video processed and uploaded successfully',
+                    'video_id': filename,
+                    'video_url': s3_video_url,
+                    'segments': len(points)
+                }
+                
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                
+        else:
+            return jsonify({'error': 'No video URL or file provided'}), 400
+        
+        qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
+        return jsonify(success_message)
+        
+    except Exception as e:
+        error_message = str(e)
+        print(f"Upload error: {error_message}")
+        return jsonify({'error': error_message}), 500
 
 def allowed_video_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_VIDEO_EXTENSIONS
@@ -156,167 +367,6 @@ def image_search():
 
     return jsonify({'error': 'Method not allowed'}), 405
 
-
-@app.route('/upload_video', methods=['POST'])
-def upload_video():
-    print("Received video upload request")
-    
-    try:
-        # Check if request contains video URL or file
-        if 'video_url' in request.form:
-            # Handle video URL upload
-            video_url = request.form['video_url']
-            print(f"Processing video URL: {video_url}")
-            
-            # Generate unique identifier for the video
-            video_id = str(uuid.uuid4())
-            
-            # Create embedding task for URL
-            task = twelvelabs_client.embed.task.create(
-                model_name="Marengo-retrieval-2.7",
-                video_url=video_url
-            )
-            
-            print(f"Created task for URL: id={task.id}, status={task.status}")
-            
-            # Wait for task completion
-            task.wait_for_done(sleep_interval=3)
-            task_result = twelvelabs_client.embed.task.retrieve(task.id)
-            
-            if task_result.status != 'ready':
-                raise ValueError(f"Task failed with status: {task_result.status}")
-            
-            # Store URL-based video information
-            points = [
-                PointStruct(
-                    id=idx,
-                    vector=v.embeddings_float,
-                    payload={
-                        'video_id': video_id,
-                        'video_url': video_url,
-                        'is_url': True,
-                        'start_offset_sec': v.start_offset_sec,
-                        'end_offset_sec': v.end_offset_sec,
-                        'embedding_scope': v.embedding_scope,
-                        'original_filename': video_url.split('/')[-1],
-                        'confidence': 'high' if idx % 2 == 0 else 'medium'
-                    }
-                )
-                for idx, v in enumerate(task_result.video_embedding.segments)
-            ]
-            
-            success_message = {
-                'message': 'Video URL processed successfully',
-                'video_id': video_id,
-                'video_url': video_url,
-                'segments': len(points)
-            }
-            
-        elif 'video' in request.files:
-            # Handle direct file upload
-            video_file = request.files['video']
-            if video_file.filename == '':
-                return jsonify({'error': 'No selected file'}), 400
-            
-            if not allowed_video_file(video_file.filename):
-                return jsonify({'error': 'Invalid file type'}), 400
-            
-            # Generate unique filename
-            filename = str(uuid.uuid4()) + '_' + secure_filename(video_file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            
-            try:
-                # Save file
-                video_file.save(file_path)
-                print(f"File saved to: {file_path}")
-                
-                # Create embedding task for file
-                task = twelvelabs_client.embed.task.create(
-                    model_name="Marengo-retrieval-2.7",
-                    video_file=file_path
-                )
-                
-                print(f"Created task for file: id={task.id}, status={task.status}")
-                
-                # Wait for task completion
-                task.wait_for_done(sleep_interval=3)
-                task_result = twelvelabs_client.embed.task.retrieve(task.id)
-                
-                if task_result.status != 'ready':
-                    raise ValueError(f"Task failed with status: {task_result.status}")
-                
-                # Store file-based video information
-                points = [
-                    PointStruct(
-                        id=idx,
-                        vector=v.embeddings_float,
-                        payload={
-                            'video_id': filename,
-                            'is_url': False,
-                            'file_path': file_path,
-                            'start_offset_sec': v.start_offset_sec,
-                            'end_offset_sec': v.end_offset_sec,
-                            'embedding_scope': v.embedding_scope,
-                            'original_filename': video_file.filename,
-                            'confidence': 'high' if idx % 2 == 0 else 'medium'
-                        }
-                    )
-                    for idx, v in enumerate(task_result.video_embedding.segments)
-                ]
-                
-                success_message = {
-                    'message': 'Video file processed successfully',
-                    'video_id': filename,
-                    'segments': len(points)
-                }
-                
-            except Exception as file_error:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                raise file_error
-                
-        else:
-            return jsonify({'error': 'No video URL or file provided'}), 400
-        
-        # Store embeddings in Qdrant
-        qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
-        return jsonify(success_message)
-        
-    except Exception as e:
-        print(f"Upload error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-    
-
-
-@app.route('/video/<video_id>')
-def serve_video(video_id):
-    try:
-        # Check if this is a URL-based video
-        search_results = qdrant_client.search(
-            collection_name=COLLECTION_NAME,
-            query_filter={
-                "must": [
-                    {"key": "video_id", "match": {"value": video_id}}
-                ]
-            },
-            limit=1
-        )
-        
-        if not search_results:
-            return jsonify({'error': 'Video not found'}), 404
-            
-        video_info = search_results[0].payload
-        
-        # If it's a URL-based video, redirect to the original URL
-        if video_info.get('is_url', False):
-            return redirect(video_info['video_url'])
-            
-        # Otherwise serve the local file
-        return send_from_directory(app.config['UPLOAD_FOLDER'], video_id)
-        
-    except Exception as e:
-        print(f"Error serving video: {str(e)}")
-        return jsonify({'error': 'Video not found'}), 404
 
 @app.route('/search', methods=['POST'])
 def search():
