@@ -1,5 +1,4 @@
 document.addEventListener('DOMContentLoaded', function() {
-    // Element references
     const elements = {
         searchInput: document.getElementById('searchInput'),
         searchButton: document.getElementById('searchButton'),
@@ -15,7 +14,16 @@ document.addEventListener('DOMContentLoaded', function() {
         resultsSection: document.getElementById('resultsSection'),
         resultsGrid: document.getElementById('resultsGrid'),
         loadingState: document.getElementById('loadingState'),
-        imageInput: document.getElementById('imageInput')
+        imageInput: document.getElementById('imageInput'),
+    
+        uploadButtons: document.querySelectorAll('.upload-options .search-type-btn'),
+        fileUpload: document.getElementById('fileUpload'),
+        urlUpload: document.getElementById('urlUpload'),
+        fileInput: document.getElementById('fileInput'),
+        videoUrlInput: document.getElementById('videoUrl'),
+        urlSubmitButton: document.getElementById('urlSubmitButton'),
+        uploadZone: document.getElementById('uploadZone'),
+        uploadProgress: document.getElementById('uploadProgress')
     };
 
 
@@ -39,6 +47,101 @@ document.addEventListener('DOMContentLoaded', function() {
 
         setupDragAndDrop();
     }
+
+
+    function initializeUploadEvents() {
+        // Upload type switching
+        elements.uploadButtons.forEach(button => {
+            button.addEventListener('click', function(e) {
+                console.log('Upload button clicked:', this.dataset.uploadType);
+                switchUploadType(this.dataset.uploadType);
+            });
+        });
+
+        // URL submission
+        elements.urlSubmitButton.addEventListener('click', handleUrlUpload);
+        elements.videoUrlInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                handleUrlUpload();
+            }
+        });
+
+        // File upload handling
+        elements.uploadZone.addEventListener('click', () => elements.fileInput.click());
+        elements.fileInput.addEventListener('change', handleFileSelect);
+
+        // Drag and drop
+        setupDragAndDrop();
+    }
+
+    function switchUploadType(type) {
+        console.log('Switching to upload type:', type);
+        
+        // Update button states
+        elements.uploadButtons.forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.uploadType === type);
+        });
+
+        // Show/hide appropriate upload sections
+        elements.fileUpload.classList.toggle('hidden', type !== 'file');
+        elements.urlUpload.classList.toggle('hidden', type !== 'url');
+    }
+
+
+    function validateVideoUrl() {
+        const url = elements.videoUrlInput.value.trim();
+        const isValid = url.length > 0 && isValidUrl(url);
+        elements.urlSubmitButton.disabled = !isValid;
+        return isValid;
+    }
+
+    function isValidUrl(url) {
+        try {
+            new URL(url);
+            return url.match(/\.(mp4|webm|ogg)$/i) !== null;
+        } catch {
+            return false;
+        }
+    }
+
+
+    async function handleUrlUpload() {
+        const videoUrl = elements.videoUrlInput.value.trim();
+        
+        if (!videoUrl) {
+            showError('Please enter a video URL');
+            return;
+        }
+
+        showUploadProgress(true);
+
+        try {
+            const formData = new FormData();
+            formData.append('video_url', videoUrl);
+
+            const response = await fetch('/upload_video', {
+                method: 'POST',
+                body: formData
+            });
+
+            const result = await response.json();
+
+            if (!response.ok) {
+                throw new Error(result.error || 'Upload failed');
+            }
+
+            showSuccess(`Successfully processed video with ${result.segments} segments`);
+            elements.videoUrlInput.value = '';
+
+        } catch (error) {
+            console.error('Upload error:', error);
+            showError('Failed to process video URL. Please try again.');
+        } finally {
+            showUploadProgress(false);
+        }
+    }
+
+
 
     function switchSearchType(type) {
         elements.searchTypeButtons.forEach(btn => {
@@ -289,6 +392,54 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    function createResultCard(result) {
+        const card = document.createElement('div');
+        card.className = 'result-card';
+        
+        const confidenceClass = result.confidence === 'high' ? 'confidence-high' : 'confidence-medium';
+        const score = (result.score * 100).toFixed(1);
+        
+        // Use video_url if it exists (for URL-based videos), otherwise use the /video endpoint
+        const videoSource = result.video_url || `/video/${result.video_id}`;
+    
+        card.innerHTML = `
+            <div class="card-media">
+                <video class="video-preview" controls>
+                    <source src="${videoSource}#t=${result.start_time}" type="video/mp4">
+                    Your browser does not support the video tag.
+                </video>
+                <span class="confidence-badge ${confidenceClass}">
+                    <i class="fas fa-check-circle"></i>
+                    ${result.confidence}
+                </span>
+                <div class="timestamp">${formatTime(result.start_time)} - ${formatTime(result.end_time)}</div>
+            </div>
+            <div class="card-content">
+                <div class="card-header">
+                    <h3 class="card-title">${result.original_filename}</h3>
+                    <span class="score">${score}% Match</span>
+                </div>
+                <div class="card-actions">
+                    <button class="action-button preview-button" data-video-source="${videoSource}" data-start-time="${result.start_time}">
+                        <i class="fas fa-play"></i> Preview
+                    </button>
+                </div>
+            </div>
+        `;
+    
+        // Add preview button handler
+        const previewButton = card.querySelector('.preview-button');
+        previewButton.addEventListener('click', () => {
+            const video = card.querySelector('.video-preview');
+            if (video) {
+                video.currentTime = result.start_time;
+                video.play();
+            }
+        });
+    
+        return card;
+    }
+
     // Display search results
     function displayResults(results) {
         elements.resultsSection.classList.remove('hidden');
@@ -312,11 +463,14 @@ document.addEventListener('DOMContentLoaded', function() {
         
         const confidenceClass = result.confidence === 'high' ? 'confidence-high' : 'confidence-medium';
         const score = (result.score * 100).toFixed(1);
+        
+        // Use video_url if it exists (for URL-based videos), otherwise use the /video endpoint
+        const videoSource = result.video_url || `/video/${result.video_id}`;
     
         card.innerHTML = `
             <div class="card-media">
                 <video class="video-preview" controls>
-                    <source src="${result.video_url || ''}" type="video/mp4">
+                    <source src="${videoSource}#t=${result.start_time}" type="video/mp4">
                     Your browser does not support the video tag.
                 </video>
                 <span class="confidence-badge ${confidenceClass}">
@@ -331,13 +485,13 @@ document.addEventListener('DOMContentLoaded', function() {
                     <span class="score">${score}% Match</span>
                 </div>
                 <div class="card-actions">
-                    <button class="action-button preview-button" data-video-url="${result.video_url}" data-start-time="${result.start_time}">
+                    <button class="action-button preview-button" data-video-source="${videoSource}" data-start-time="${result.start_time}">
                         <i class="fas fa-play"></i> Preview
                     </button>
                 </div>
             </div>
         `;
-
+    
         // Add preview button handler
         const previewButton = card.querySelector('.preview-button');
         previewButton.addEventListener('click', () => {
@@ -350,6 +504,8 @@ document.addEventListener('DOMContentLoaded', function() {
     
         return card;
     }
+
+
     // Create no results HTML
     function createNoResultsHtml() {
         return `
@@ -403,7 +559,16 @@ document.addEventListener('DOMContentLoaded', function() {
         const remainingSeconds = Math.floor(seconds % 60);
         return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
     }
-
+    
+    
+    document.querySelectorAll('input[name="uploadType"]').forEach(radio => {
+        radio.addEventListener('change', (e) => {
+            document.getElementById('fileUploadSection').style.display = 
+                e.target.value === 'file' ? 'block' : 'none';
+            document.getElementById('urlUploadSection').style.display = 
+                e.target.value === 'url' ? 'block' : 'none';
+        });
+    });
     // Setup drag and drop functionality
     function setupDragAndDrop() {
         const dropZone = elements.uploadZone;
@@ -439,4 +604,5 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Initialize the application
     initializeEventListeners();
+    initializeUploadEvents();
 });

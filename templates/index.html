@@ -65,23 +65,49 @@
             </div>
 
             <!-- Upload Section -->
-            <div class="upload-section">
+            <section class="upload-section">
                 <h2>Add New Content</h2>
-                <div class="upload-zone" id="uploadZone">
-                    <i class="fas fa-cloud-upload-alt upload-icon"></i>
-                    <p>Drag and drop your video here or click to browse</p>
-                    <input type="file" id="fileInput" class="hidden" accept="video/*">
+                
+                <!-- Upload Type Selection -->
+                <div class="upload-options">
+                    <button class="search-type-btn active" data-upload-type="file">
+                        <i class="fas fa-file-upload"></i>
+                        File Upload
+                    </button>
+                    <button class="search-type-btn" data-upload-type="url">
+                        <i class="fas fa-link"></i>
+                        Video URL
+                    </button>
                 </div>
+
+                <!-- File Upload Zone -->
+                <div class="upload-box" id="fileUpload">
+                    <div class="upload-zone" id="uploadZone">
+                        <i class="fas fa-cloud-upload-alt upload-icon"></i>
+                        <p>Drag and drop your video here or click to browse</p>
+                        <input type="file" id="fileInput" class="hidden" accept="video/*">
+                    </div>
+                </div>
+
+                <!-- URL Upload Zone -->
+                <div class="upload-box hidden" id="urlUpload">
+                    <div class="url-input-container">
+                        <input type="text" id="videoUrl" class="search-input" placeholder="Enter video URL...">
+                        <button class="search-button" id="urlSubmitButton">
+                            <span>Upload</span>
+                            <i class="fas fa-arrow-right"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Upload Progress -->
                 <div id="uploadProgress" class="upload-progress hidden">
                     <div class="progress-bar">
                         <div class="progress-fill"></div>
                     </div>
                     <p class="progress-text">Processing video...</p>
                 </div>
-            </div>
-        </div>
-    </section>
-
+            </section>
     <!-- Results Section -->
     <section class="results-section hidden" id="resultsSection">
         <div class="container">
